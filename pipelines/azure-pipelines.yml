@@ -1,0 +1,109 @@
+trigger:
+  batch: true
+  branches:
+    include:
+    - master
+
+parameters:
+- name: test
+  displayName: Run Tests?
+  type: boolean
+  default: true
+
+variables:
+  - name: tag
+    value: '$(Build.BuildId)'
+  - group: flask-app-common
+
+stages:
+- stage: 'Build'
+  displayName: 'Build the web application'
+  jobs: 
+  - job: 'UnitTests'
+    condition:  eq('${{ parameters.test }}', 'true')
+    displayName: "Run unit tests"
+
+    steps:
+    - script: pip install -r requirements.txt
+      displayName: 'Install requirements'
+
+    - script: |
+        pip install pytest pytest-azurepipelines
+        pip install pytest-cov
+        python -m pytest --doctest-modules --junitxml=junit/test-results.xml --cov=hello_app --cov-report=xml
+      displayName: 'pytest'
+
+    - task: PublishTestResults@2
+      condition: succeededOrFailed()
+      inputs:
+        testResultsFiles: '**/test-*.xml'
+        testRunTitle: 'Publish test results for Hello App'
+
+  - job: 'Build'
+    dependsOn: UnitTests
+    displayName: 'Build job'
+    pool:
+      vmImage: 'ubuntu-20.04'
+
+    steps:
+    - task: Docker@2
+      inputs:
+        command: 'build'
+        Dockerfile: '**/Dockerfile'
+        repository: $(imageRepository)
+        tags: |
+          $(tag)
+    
+    - task: ECRPushImage@1
+      name: 'PushToECR'
+      inputs:
+        awsCredentials: 'sbd-aws'
+        regionName: 'us-east-1'
+        imageSource: 'imagename'
+        sourceImageName: $(imageRepository)
+        sourceImageTag: $(tag)
+        pushTag: $(tag)
+        repositoryName: $(imageRepository)
+        autoCreateRepository: true
+        outputVariable: 'ecrPushOutput'
+        logRequest: true
+        logResponse: true
+
+    - pwsh: |
+        Write-Host "##vso[task.setvariable variable=ecrImage;isOutput=true]$(ecrPushOutput)"
+      name: ECRImageOutputStep
+        
+    - task: CopyFiles@2
+      inputs:
+        sourceFolder: $(Build.SourcesDirectory)/manifests
+        targetFolder: $(Build.ArtifactStagingDirectory)/k8s/manifests
+
+    - publish: $(build.artifactStagingDirectory)
+      artifact: drop
+    # Publish a Universal Package
+    - task: UniversalPackages@0
+      displayName: Universal Publish
+      inputs:
+        command: publish
+        publishDirectory: '$(Build.ArtifactStagingDirectory)'
+        vstsFeedPublish: 'learning/python-sample-vscode-flask-tutorial'
+        vstsFeedPackagePublish: 'python-sample-vscode-flask-tutorial'
+        packagePublishDescription: 'Python Flask application'
+
+- stage: Dev
+  displayName: 'Deploy to the Dev environment'
+  dependsOn: Build
+  jobs:
+  - template: templates/deploy-kubernetes.yaml
+    parameters:
+      variableGroup: flask-app-dev
+      environment: dev
+
+- stage: Prod
+  displayName: 'Deploy to the Prod environment'
+  dependsOn: Dev
+  jobs:
+  - template: templates/deploy-kubernetes.yaml
+    parameters:
+      variableGroup: flask-app-prod
+      environment: prod
